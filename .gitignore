@@ -1,0 +1,39 @@
+﻿# Obsidian vault settings and workspace state
+.obsidian/
+
+# Build output
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+ARM64/
+
+# Compiled binaries and intermediate files
+*.dll
+*.exe
+*.lib
+*.exp
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.idb
+*.ipch
+*.tlog
+*.lastbuildstate
+*.dll.recipe
+*.exe.recipe
+*.Build.CppClean.log
+
+# Visual Studio local settings and caches
+.vs/
+*.vcxproj.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.db-shm
+*.VC.db-wal
+*.VC.opendb
+*.sdf
+*.opensdf
