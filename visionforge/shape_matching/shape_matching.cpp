@@ -57,6 +57,10 @@ struct rotated_model
     double min_y;
     double max_y;
     std::vector<feature> features;
+    shape_match_point top_left;
+    shape_match_point top_right;
+    shape_match_point bottom_left;
+    shape_match_point bottom_right;
 };
 
 struct candidate
@@ -225,6 +229,13 @@ std::vector<rotated_model> rotations(const model_level& model, const std::vector
         const double extent_x = std::abs(c) * model.half_width + std::abs(s) * model.half_height;
         const double extent_y = std::abs(s) * model.half_width + std::abs(c) * model.half_height;
         rotated_model rotated{-extent_x, extent_x, -extent_y, extent_y, {}};
+        const auto rotate_corner = [&](double x, double y) -> shape_match_point {
+            return {c * x - s * y, s * x + c * y};
+        };
+        rotated.top_left = rotate_corner(-model.half_width, -model.half_height);
+        rotated.top_right = rotate_corner(model.half_width, -model.half_height);
+        rotated.bottom_left = rotate_corner(-model.half_width, model.half_height);
+        rotated.bottom_right = rotate_corner(model.half_width, model.half_height);
         rotated.features.reserve(model.features.size());
         for (const auto& f : model.features)
             rotated.features.push_back({c * f.x - s * f.y, s * f.x + c * f.y,
@@ -435,6 +446,12 @@ shape_match_result shape_matcher::match(const image& source) const
     if (candidates.empty())
         return {};
     const auto& best = candidates.front();
-    return {best.score >= settings.minimum_score, best.x, best.y, impl_->angles[best.angle], best.score};
+    const auto& bounds = rotated[best.angle];
+    const auto translate = [&](const shape_match_point& point) -> shape_match_point {
+        return {best.x + point.x, best.y + point.y};
+    };
+    return {best.score >= settings.minimum_score, best.x, best.y, impl_->angles[best.angle], best.score,
+            translate(bounds.top_left), translate(bounds.top_right),
+            translate(bounds.bottom_left), translate(bounds.bottom_right)};
 }
 }

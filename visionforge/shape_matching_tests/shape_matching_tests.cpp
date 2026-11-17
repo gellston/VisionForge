@@ -188,6 +188,52 @@ void test_matching()
     require(move_assigned.has_template() && !assigned.has_template(), "Move assignment lost template");
 }
 
+void test_result_corners()
+{
+    // Inverse-transform reported corners into template coordinates to check both
+    // their identities and their original-resolution extent after refinement.
+    for (const std::size_t levels : {std::size_t{1}, std::size_t{3}})
+    {
+        for (const bool even : {false, true})
+        {
+            const auto model = even ? pattern(26, 24) : pattern();
+            for (const double angle : {0.0, 30.0, -30.0, 90.0, -90.0, 180.0})
+            {
+                shape_match_options options;
+                options.pyramid_levels = levels;
+                options.rotation_min_degrees = angle;
+                options.rotation_max_degrees = angle;
+                options.minimum_score = 0.65;
+                shape_matcher matcher(options);
+                matcher.set_template(model);
+                const double cx = even ? 50.5 : 50.0;
+                const double cy = even ? 45.5 : 45.0;
+                const auto result = matcher.match(scene(model, cx, cy, angle));
+                check_location(result, cx, cy, angle);
+                const double c = std::cos(result.angle_degrees * pi / 180.0);
+                const double s = std::sin(result.angle_degrees * pi / 180.0);
+                const auto check_corner = [&](const shape_match_point& point, double tx, double ty) {
+                    const double dx = point.x - result.x, dy = point.y - result.y;
+                    require(std::abs(c * dx + s * dy + (model.width() - 1.0) / 2.0 - tx) < 1e-9
+                         && std::abs(-s * dx + c * dy + (model.height() - 1.0) / 2.0 - ty) < 1e-9,
+                            "Incorrect rotated template corner");
+                };
+                check_corner(result.top_left, 0.0, 0.0);
+                check_corner(result.top_right, model.width() - 1.0, 0.0);
+                check_corner(result.bottom_left, 0.0, model.height() - 1.0);
+                check_corner(result.bottom_right, model.width() - 1.0, model.height() - 1.0);
+
+                const auto missing = matcher.match(image(96, 88, 1));
+                require(!missing.found && missing.top_left.x == 0.0 && missing.top_left.y == 0.0
+                     && missing.top_right.x == 0.0 && missing.top_right.y == 0.0
+                     && missing.bottom_left.x == 0.0 && missing.bottom_left.y == 0.0
+                     && missing.bottom_right.x == 0.0 && missing.bottom_right.y == 0.0,
+                        "Empty match must return default corners");
+            }
+        }
+    }
+}
+
 void test_validation()
 {
     shape_matcher matcher;
@@ -219,7 +265,7 @@ int main()
 {
     static_assert(std::is_nothrow_move_constructible_v<visionforge::v1::shape_matcher>);
     static_assert(std::is_standard_layout_v<visionforge::v1::shape_match_result>);
-    try { test_matching(); test_validation(); }
+    try { test_matching(); test_result_corners(); test_validation(); }
     catch (const std::exception& error)
     {
         std::cerr << error.what() << '\n';

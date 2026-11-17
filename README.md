@@ -169,6 +169,14 @@ Gaussian 필터는 피라미드를 축소할 때 앨리어싱을 줄이는 용�
 | `x`, `y`             | 원본 영상에서 템플릿 중심 좌표. `found=true`일 때 사용 |
 | `angle_degrees`      | 선택된 회전 각도. `found=true`일 때 사용         |
 | `score`              | 0~1의 gradient 방향 일치 점수                |
+| `top_left`, `top_right` | 회전된 템플릿의 좌상단·우상단 좌표 (`shape_match_point`) |
+| `bottom_left`, `bottom_right` | 회전된 템플릿의 좌하단·우하단 좌표 (`shape_match_point`) |
+
+네 꼭짓점의 `x`, `y`는 원본 영상의 실수 픽셀 좌표이며 `found=true`일 때 사용합니다.
+템플릿의 `(0, 0)`부터 `(width - 1, height - 1)`까지의 픽셀 중심 사각형을 탐지 각도로 회전한 결과입니다.
+꼭짓점 이름은 회전 전 템플릿 기준으로 유지합니다.
+사각형을 그릴 때는 `top_left → top_right → bottom_right → bottom_left → top_left` 순서로 연결합니다.
+결과 구조체의 크기가 변경되었으므로 DLL과 호출 프로그램을 함께 다시 빌드해야 합니다.
 
 점수는 회전된 템플릿과 원본 gradient의 정규화 내적을 평균한 값입니다.
 사라지거나 방향이 반대인 특징은 0점으로 계산합니다. 밝기 대비가 반전된 모양을 같은 모양으로 취급하지 않습니다.

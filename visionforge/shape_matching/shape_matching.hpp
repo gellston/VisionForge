@@ -22,6 +22,12 @@ struct shape_match_options
     std::size_t candidate_count = 32;
 };
 
+struct shape_match_point
+{
+    double x = 0.0;
+    double y = 0.0;
+};
+
 struct shape_match_result
 {
     bool found = false;
@@ -31,6 +37,14 @@ struct shape_match_result
     // Positive angles rotate clockwise in image coordinates.
     double angle_degrees = 0.0;
     double score = 0.0;
+    // Rotated template corners in original source-image pixels; valid when found is true.
+    // Names refer to the unrotated template corners, and follow its rotation.
+    // Bounds use pixel centers: (0, 0) through (width - 1, height - 1).
+    // Draw in order: top_left, top_right, bottom_right, bottom_left, top_left.
+    shape_match_point top_left;
+    shape_match_point top_right;
+    shape_match_point bottom_left;
+    shape_match_point bottom_right;
 };
 
 class shape_matcher
