@@ -142,9 +142,24 @@ visionforge::v1::shape_match_result find_shape(
 | `gradient_threshold`    | `8.0`    | Sobel gradient를 8로 나눈 크기의 하한. 0 초과, 255 이하 |
 | `maximum_features`      | `512`    | 레벨별 템플릿 특징 수 상한. 4~4096                    |
 | `candidate_count`       | `32`     | 다음 레벨로 전달할 후보 수 상한. 1~256                  |
+| `refine_position_radius`| `2`      | 각 후보를 재탐색할 반경(px). 0~256. 0이면 위치 보정 생략     |
+| `refine_angle_steps`    | `1`      | 각 후보를 재탐색할 각도 스텝 수. 0~4094. 0이면 각도 보정 생략 |
+| `edge_count_threshold`  | `0`      | 첫 스캔의 엣지 필터 막대. 0~1000000                          |
 
 각도는 도 단위이며 화면 좌표에서 시계 방향이 양수입니다.
 범위는 -360~360도 안에 있어야 하고, 시작값은 종료값 이하여야 하며, 전체 범위는 360도를 넘을 수 없습니다.
+첫 번째(가장 저해상도) 스캔은 **적분이미지 사전 필터**를 거칩니다. 후보의 회전된 템플릿 바운딩 박스 안에 있는 엣지 픽셀 수를 네 번의 읽기로 세어,
+그 수가 `edge_count_threshold`보다 적으면 스코어를 계산하지 않고 후보에서 제외합니다.
+박스에 엣지가 하나도 없으면 모든 특징이 정확히 0점을 받아 스코어가 0이 되므로 제외해도 결과가 동일합니다(증명된 경로).
+다만 이 필터는 **희소한 엣지 맵에서만 이득**입니다. 엣지가 조밀한 맵(원본 해상도의 노이즈 이미지 등)에서는 박스에
+엣지가 항상 들어 있어 검사비만 들고 아무것도 걸러내지 못하므로, `edge_count_threshold = 0`인 기본값에서는
+엣지 밀도를 재서 필터를 자동으로 끕니다(결과는 항상 동일합니다).
+`edge_count_threshold`를 0보다 크게 지정하면 **밀도와 무관하게 항상 적용**되며, 이는
+**속도를 위해 재현율을 거는 거래**라서 너무 높이면 실제 매치까지 걸러낼 수 있습니다.
+
+`refine_position_radius`와 `refine_angle_steps`는 각 레벨에서 후보 한 개당 스코어를 `(2*반경+1)^2 * (2*스텝+1)`회 계산하게 하므로,
+키우면 탐색 정밀도와 시간이 함께 늘어납니다. 0으로 줄이면 코스 레벨의 결과를 그대로 이어받아 가장 빠르지만,
+코스 레벨이 정답에 못 미치면 보정할 기회가 없어 정확도가 떨어집니다.
 시작값과 종료값을 같게 지정하면 해당 각도만 검색합니다.
 간격이 범위를 정확히 나누지 못해도 종료 각도를 검색합니다. 한 바퀴의 양 끝처럼 같은 방향인 후보는 중복 제거합니다.
 각도 후보 수는 최대 4096개이며 실수 옵션은 모두 유한한 값이어야 합니다.
@@ -186,5 +201,43 @@ Gaussian 필터는 피라미드를 축소할 때 앨리어싱을 줄이는 용�
 `clear_template()`은 등록한 템플릿을 제거합니다.
 등록 전에 `match()`를 호출하면 `std::logic_error`, 잘못된 옵션·입력·템플릿에는 `std::invalid_argument`가 발생합니다.
 새 템플릿 등록에 실패하면 기존 템플릿을 유지합니다.
+
+### 회전된 템플릿 모서리
+
+`rotated_template_corners()`는 등록한 템플릿을 각 후보 각도로 회전한 모서리 좌표를 반환합니다.
+탐색에 사용하는 순서 그대로 각도 한 개당 항목 하나이며, 템플릿이 없으면 빈 목록입니다.
+
+| `shape_rotation_corners` | 설명                                          |
+| ------------------------ | ------------------------------------------- |
+| `angle_degrees`          | 이 모서리가 대응하는 회전 각도                        |
+| `top_left`, `top_right`  | 회전된 좌상단·우상단 좌표 (`shape_match_point`)         |
+| `bottom_left`, `bottom_right` | 회전된 좌하단·우하단 좌표 (`shape_match_point`)    |
+
+좌표는 **원본 영상이 아니라 템플릿 중심 기준**입니다. 어느 영상 위에 그릴지 정하려면 중심 좌표를 더합니다.
+
+```cpp
+const auto boxes = matcher.rotated_template_corners();   // 각도마다 1항목
+for (const auto& box : boxes)
+{
+    // box.angle_degrees 로 각도 확인, 중심 (cx, cy)에 그릴 때:
+    const double left   = cx + box.top_left.x;
+    const double top    = cy + box.top_left.y;
+    const double right  = cx + box.bottom_right.x;
+    const double bottom = cy + box.bottom_right.y;
+}
+```
+
+`shape_match_result`의 네 꼭짓점은 이미 원본 영상 좌표로 번역된 값이라 그대로 그릴 수 있고,
+`rotated_template_corners()`의 항목에 중심을 더하면 같은 좌표가 됩니다.
+
+### 캐시 동작
+
+`set_template()`은 템플릿 피라미드의 모든 레벨에 대해 **회전된 특징·바운딩 박스·모서리를 미리 계산**해 보관합니다.
+옵션은 생성 후 변경할 수 없으므로 각도 목록도 고정이라, 계산 결과를 `match()`가 끝까지 재사용합니다.
+따라서 같은 템플릿으로 `match()`를 여러 번 호출할 때 회전 계산 비용은 발생하지 않습니다.
+`clear_template()`은 이 캐시도 함께 비웁니다.
+
+메모리는 레벨 수 × 각도 수 × 특징 수에 비례합니다. 기본 옵션(3레벨, 72각도, 특징 최대 512)에서
+레벨당 최대 약 1.1 MiB이므로, `maximum_features`를 크게 올리면 캐시 크기도 그만큼 커집니다.
 
 스마트 포인터 별칭은 `shape_matcher::shared_shape_matcher`, `shared_const_shape_matcher`, `unique_shape_matcher`입니다.

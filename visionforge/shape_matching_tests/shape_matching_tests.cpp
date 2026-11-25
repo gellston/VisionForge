@@ -7,6 +7,9 @@
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
+#ifdef _MSC_VER
+#include <crtdbg.h>
+#endif
 #include <utility>
 
 namespace
@@ -261,11 +264,246 @@ void test_validation()
 }
 }
 
+void test_full_rotation_range()
+{
+    // The rotation range is an option; exercise it explicitly at -180..180 with
+    // every other option left at its default.
+    const auto model = pattern();
+    shape_match_options options;
+    options.rotation_min_degrees = -180.0;
+    options.rotation_max_degrees = 180.0;
+    shape_matcher matcher(options);
+    require(matcher.options().rotation_min_degrees == -180.0
+         && matcher.options().rotation_max_degrees == 180.0,
+            "Rotation range must be readable back from options()");
+    matcher.set_template(model);
+
+    // A full turn of 5 degree steps drops one endpoint: -180 and 180 describe the
+    // same orientation, so the candidate list is -180..175.
+    const auto corners = matcher.rotated_template_corners();
+    require(corners.size() == 72, "Full 360 degree range must yield 72 candidates");
+    require(corners.front().angle_degrees == -180.0, "Full range must start at -180");
+    require(corners.back().angle_degrees == 175.0, "Full range must stop at 175");
+    for (std::size_t i = 1; i < corners.size(); ++i)
+        require(std::abs((corners[i].angle_degrees - corners[i - 1].angle_degrees) - 5.0) < 1e-12,
+                "Full range candidates must stay 5 degrees apart");
+
+    // Every other option is still at its default.
+    require(matcher.options().pyramid_levels == 3
+         && matcher.options().rotation_step_degrees == 5.0
+         && matcher.options().minimum_score == 0.7
+         && matcher.options().gradient_threshold == 8.0
+         && matcher.options().maximum_features == 512
+         && matcher.options().candidate_count == 32
+         && matcher.options().refine_position_radius == 2
+         && matcher.options().refine_angle_steps == 1,
+            "Untouched options must keep their defaults");
+
+    // Match across the whole circle. 180 is skipped: its grid slot is -180,
+    // and the tolerance in check_location is an absolute degree difference.
+    const double cx = 50.0, cy = 45.0;
+    for (const double angle : {-180.0, -175.0, -135.0, -90.0, -45.0,
+                               0.0, 30.0, 45.0, 90.0, 135.0, 175.0})
+    {
+        const auto result = matcher.match(scene(model, cx, cy, angle));
+        check_location(result, cx, cy, angle);
+        require(result.score >= 0.7, "Full-range match must clear the default minimum_score");
+    }
+}
+
+void test_rotation_corners()
+{
+    // No template yet: no rotations to report.
+    shape_matcher empty;
+    require(empty.rotated_template_corners().empty(), "Empty matcher must report no rotation corners");
+
+    const auto model = pattern();
+    shape_match_options options;
+    options.rotation_min_degrees = -30.0;
+    options.rotation_max_degrees = 30.0;
+    options.rotation_step_degrees = 15.0;
+    options.minimum_score = 0.65;
+    shape_matcher matcher(options);
+    matcher.set_template(model);
+    const auto corners = matcher.rotated_template_corners();
+    // -30, -15, 0, 15, 30 -> five angles.
+    require(corners.size() == 5, "Rotation corners must cover every configured angle");
+
+    const double half_w = (model.width() - 1.0) / 2.0;
+    const double half_h = (model.height() - 1.0) / 2.0;
+    for (std::size_t i = 0; i < corners.size(); ++i)
+    {
+        require(std::abs(corners[i].angle_degrees - (-30.0 + 15.0 * static_cast<double>(i))) < 1e-12,
+                "Rotation corner angles must follow the configured sequence");
+        const double c = std::cos(corners[i].angle_degrees * pi / 180.0);
+        const double s = std::sin(corners[i].angle_degrees * pi / 180.0);
+        // Corners are template-center relative: rotate the unrotated offsets and compare.
+        const auto check = [&](const shape_match_point& point, double tx, double ty) {
+            require(std::abs(point.x - (c * tx - s * ty)) < 1e-9
+                 && std::abs(point.y - (s * tx + c * ty)) < 1e-9,
+                    "Rotation corner does not match the rotation matrix");
+        };
+        check(corners[i].top_left, -half_w, -half_h);
+        check(corners[i].top_right, half_w, -half_h);
+        check(corners[i].bottom_left, -half_w, half_h);
+        check(corners[i].bottom_right, half_w, half_h);
+        // A box's diagonals stay equal length under rotation.
+        const double d1 = std::hypot(corners[i].top_right.x - corners[i].bottom_left.x,
+                                     corners[i].top_right.y - corners[i].bottom_left.y);
+        const double d2 = std::hypot(corners[i].bottom_right.x - corners[i].top_left.x,
+                                     corners[i].bottom_right.y - corners[i].top_left.y);
+        require(std::abs(d1 - d2) < 1e-9 && std::abs(d1 - std::hypot(2.0 * half_w, 2.0 * half_h)) < 1e-9,
+                "Rotation must preserve the template diagonal");
+    }
+
+    // Reported corners must agree with the winning match's translated corners.
+    const auto result = matcher.match(scene(model, 54.0, 49.0, 15.0));
+    check_location(result, 54.0, 49.0, 15.0);
+    std::size_t best = 0;
+    for (std::size_t i = 0; i < corners.size(); ++i)
+        if (std::abs(corners[i].angle_degrees - result.angle_degrees) < 1e-12)
+            best = i;
+    require(std::abs(corners[best].top_left.x + result.x - result.top_left.x) < 1e-9
+         && std::abs(corners[best].top_left.y + result.y - result.top_left.y) < 1e-9,
+            "Rotation corners must translate into the match result corners");
+
+    // Clearing drops the cache along with the template.
+    matcher.clear_template();
+    require(matcher.rotated_template_corners().empty(), "Cleared matcher must report no rotation corners");
+}
+
+void test_refine_options()
+{
+    const auto model = pattern();
+    const auto rotated = scene(model, 54.0, 49.0, 30.0);
+
+    // Defaults keep the historical neighborhood: +/-2 px and +/-1 angle step.
+    shape_matcher defaults;
+    require(defaults.options().refine_position_radius == 2
+         && defaults.options().refine_angle_steps == 1,
+            "Refine defaults must stay at 2 px and 1 angle step");
+
+    // Widening the neighborhood still finds the same pose.
+    shape_match_options wide;
+    wide.refine_position_radius = 4;
+    wide.refine_angle_steps = 2;
+    shape_matcher wide_matcher(wide);
+    wide_matcher.set_template(model);
+    check_location(wide_matcher.match(rotated), 54.0, 49.0, 30.0);
+
+    // A zero neighborhood skips local search entirely: refine scores only the
+    // doubled coarse position at the coarse angle. That is valid input and must
+    // run, but it can only succeed when the coarse level already landed on the
+    // answer, so the pose itself is not guaranteed here.
+    shape_match_options pinned;
+    pinned.refine_position_radius = 0;
+    pinned.refine_angle_steps = 0;
+    shape_matcher pinned_matcher(pinned);
+    pinned_matcher.set_template(model);
+    const auto pinned_result = pinned_matcher.match(rotated);
+    require(std::isfinite(pinned_result.score) && pinned_result.score >= 0.0
+         && pinned_result.score <= 1.0,
+            "Zero-radius refine must produce a finite score in range");
+
+    // Out-of-range neighborhoods are rejected up front.
+    using setter = void (*)(shape_match_options&);
+    const setter invalid[] = {
+        [](shape_match_options& o) { o.refine_position_radius = 257; },
+        [](shape_match_options& o) { o.refine_angle_steps = 4095; },
+    };
+    for (const auto bad : invalid)
+    {
+        shape_match_options options;
+        bad(options);
+        require_throws<std::invalid_argument>([&] { shape_matcher rejected(options); });
+    }
+}
+
+void test_edge_count_threshold()
+{
+    const auto model = pattern();
+    const auto source = scene(model, 54.0, 49.0, 30.0);
+
+    // Default keeps the provable floor: drop only boxes holding no edge at all.
+    shape_matcher defaults;
+    require(defaults.options().edge_count_threshold == 0,
+            "Edge count threshold must default to 0");
+    defaults.set_template(model);
+    check_location(defaults.match(source), 54.0, 49.0, 30.0);
+
+    // 1 asks for the same floor the default already applies.
+    shape_match_options one;
+    one.edge_count_threshold = 1;
+    shape_matcher one_matcher(one);
+    one_matcher.set_template(model);
+    check_location(one_matcher.match(source), 54.0, 49.0, 30.0);
+
+    // A bar no bounding box can reach filters every candidate out of the scan.
+    shape_match_options impossible;
+    impossible.edge_count_threshold = 1000;
+    shape_matcher none(impossible);
+    none.set_template(model);
+    require(!none.match(source).found,
+            "An unreachable edge count threshold must reject every candidate");
+
+    // Out-of-range thresholds are refused up front.
+    shape_match_options too_high;
+    too_high.edge_count_threshold = 1000001;
+    require_throws<std::invalid_argument>([&] { shape_matcher rejected(too_high); });
+}
+
+// The object is placed hard against each corner so refine()'s candidate
+// regions reach the map border. A Sobel window reads one pixel either side, so
+// lazy_gradients() must clamp to width - 2 / height - 2 exactly as gradients()
+// does. Clamping to width - 1 instead let value(1, 0) read input.pixels[width]
+// -- one past the end, which Debug's checked operator[] rejects with a dialog
+// while Release silently reads neighbouring heap. Regions never reached the
+// border in the other tests, so only a placement like this exposes it.
+void test_border_object()
+{
+    const auto model = pattern();
+    shape_matcher matcher;
+    matcher.set_template(model);
+    const struct
+    {
+        double cx;
+        double cy;
+        const char* where;
+    } placements[] = {
+        {14.0, 13.0, "top-left"},
+        {82.0, 13.0, "top-right"},
+        {14.0, 75.0, "bottom-left"},
+        {82.0, 75.0, "bottom-right"},
+    };
+    for (const auto& placement : placements)
+    {
+        std::cout << "border " << placement.where << ": ";
+        const auto result = matcher.match(scene(model, placement.cx, placement.cy, 0.0));
+        check_location(result, placement.cx, placement.cy, 0.0);
+    }
+}
+
 int main()
 {
+#ifdef _MSC_VER
+    // Debug's checked STL paths report through a modal dialog by default, so a
+    // failure leaves the test sitting on a click instead of exiting. Send those
+    // reports to stderr so the run fails loudly and cleanly on every platform
+    // the suite is expected to pass on.
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+#endif
+    // Unbuffered, so a hard abort inside a checked path still shows which test
+    // was running instead of losing the buffered lines.
+    std::cout << std::unitbuf;
     static_assert(std::is_nothrow_move_constructible_v<visionforge::v1::shape_matcher>);
     static_assert(std::is_standard_layout_v<visionforge::v1::shape_match_result>);
-    try { test_matching(); test_result_corners(); test_validation(); }
+    try { test_matching(); test_result_corners(); test_rotation_corners();
+          test_full_rotation_range(); test_refine_options(); test_edge_count_threshold();
+          test_border_object();
+          test_validation(); }
     catch (const std::exception& error)
     {
         std::cerr << error.what() << '\n';
