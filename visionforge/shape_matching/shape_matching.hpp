@@ -33,6 +33,13 @@ struct shape_match_options
     // raise it to also drop boxes whose edges are too sparse to be worth scoring.
     // This trades recall for speed: too high and real matches get filtered out.
     std::size_t edge_count_threshold = 0;
+    // Take the coarsest scan's candidates straight to the finest level in one
+    // hop instead of refining one level at a time: pyramid_levels - 1 refine
+    // stages become 1, so it is faster, but the coarse position error is never
+    // narrowed in between. The match is less accurate for it, and the error a
+    // coarse position carries is 2^(pyramid_levels - 1) finest-level pixels, so
+    // raise refine_position_radius if matches start being missed.
+    bool direct_refine = false;
 };
 
 struct shape_match_point

@@ -61,13 +61,23 @@ cd visionforge/x64/Release && ./image_tests.exe && ./shape_matching_tests.exe
   - **그라디언트 맵은 코스 레벨만 전체 구축**한다. `full_search()`가 그 맵 전체를 훑으므로 필요하지만,
     refine이 쓰는 fine 레벨은 `visit_regions()`가 후보 상자를 뽑고 `lazy_gradients()`가 **그 상자 안만**
     Sobel한다 — 나머지는 0으로 남고 어디서도 읽히지 않는다. 그런 맵에선 두 fast path가 꺼진다.
+  - **레벨은 후보 상자 기반으로 만든다** (`match()` 경로). `pyramid_coarse()`는 레벨0 전체 평면을 아예
+    만들지 않고 grayscale을 첫 다운샘플의 행 버퍼에 융합하며, refine 레벨은 `level_boxes()`가
+    **원본에서 후보 상자만 크롭**해 `k`회 다운샘플한다. 상자에 **필터 반경만큼 마진**을 줘야 상자 픽셀이
+    크롭 경계에 클램프되지 않고 체인 결과와 **비트 동일**이 유지된다. 크롭은 `x0`/`y0`(원점)과
+    `level_width`/`level_height`(레벨 전체 크기)를 함께 들고 — 크롭 `width`로 레벨을 클램프하면 유니온이
+    좁아져 채움 루프가 한 픽셀 밖으로 쓴다(힙 손상 `0xC0000374`).
+  - **`direct_refine = true`면 중간 레벨을 건너뛴다.** 코스 후보를 `2^(pyramid_levels-1)`배 환산해
+    최종 레벨로 한 번에 홉하고 보정은 한 번만(`target=0` 후 `break`). `refine()`/`visit_regions()`의
+    `×2`가 `scale` 파라미터로 일반화돼 있다. 기본 `false`는 기존 점진적 동작 그대로.
   - `configure_edge_paths()`가 `edge_density`로 적분이미지 사전 필터·엣지 마스크를 켜고 끔.
   - `full_search()`는 y-불변항을 행 루프로 호이스트하고, 각도별로 `floor(x + K) = x + floor(K)`가
     구간 양 끝에서 확인될 때 나머지 `std::floor`도 루프 밖으로 뺀다. 불일치하면 원래 식으로 폴백하므로
     어느쪽이든 출력이 비트 동일하다.
 - `*_tests/` — 이미지 연산/매칭 검증. 회전된 네 꼭짓점은 역변환으로 역검증.
   `shape_matching_tests`: matching / result_corners / rotation_corners / full_rotation_range /
-  refine_options / edge_count_threshold / **border_object**(네 모서리 경계) / validation.
+  refine_options / edge_count_threshold / **border_object**(네 모서리 경계) /
+  **direct_refine**(점진적 vs 한 번에 홉, 시간까지 출력) / validation.
 - 빌드 매크로: `visionforge_building_library` / `visionforge_building_shape_matching`은 DLL 빌드 시에만 정의.
   사용 프로그램에는 정의하지 않는다.
 
@@ -100,6 +110,15 @@ cd visionforge/x64/Release && ./image_tests.exe && ./shape_matching_tests.exe
   5MiB 매치 135 → 94ms. 단일 채널에선 부분합이 전부 정수라(≤65,280 < 2²⁴) **출력이 비트 동일**하다.
   참고로 3×3으로 줄이면(9탭) 109ms로 가분 5×5보다 느리고 behavior까지 바뀐다.
 - `make_angles()`의 `span == 360.0`은 정확한 double 비교 — 근사값은 중복 제거 안 됨 (known, 정확성 무관).
+- **크롭 원점과 레벨 전체 크기를 반드시 구분할 것.** `lazy_gradients()`의 유니온을 크롭 `width`로
+  클램프하면 `union_x1`이 좁아지고, 채움 루프는 여전히 레벨 `width`로 클램프해 `x = union_x1 + 1`에서
+  `result.pixels`를 한 개 넘겨쓴다 → Release는 `0xC0000374`(STATUS_HEAP_CORRUPTION), Debug는
+  `vector subscript out of range`. CRT 메시지엔 라인이 없으므로 의심 지점에 좌표를 출력하는
+  임시 가드를 넣어 특정한 뒤 반드시 제거할 것.
+- **`pyramid_coarse()`는 `validate_source()`를 직접 호출해야 한다.** 예전엔 `grayscale()`을 거쳐
+  그쪽의 채널/크기 검증이 걸렸는데, 코스 레벨만 만드는 구조로 바뀌면서 검증이 빠졌다 —
+  `match(image{})`(빈 이미지)와 `match(image(32,32,2))`(2채널)가 예외를 안 던졌다.
+  `validate_source()`를 추출해 두 진입점이 공유한다.
 - `shape_match_result` 크기 변경 시 DLL과 호출 프로그램을 함께 다시 빌드해야 한다 (README에 명시).
 
 ## 로컬 스킬 관리 (`.hermes/skills/`)

@@ -1,6 +1,8 @@
 ﻿#include "shape_matching.hpp"
 
 #include <algorithm>
+#include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -459,6 +461,62 @@ void test_edge_count_threshold()
 // -- one past the end, which Debug's checked operator[] rejects with a dialog
 // while Release silently reads neighbouring heap. Regions never reached the
 // border in the other tests, so only a placement like this exposes it.
+
+// direct_refine hops the coarse scan's candidates straight to the finest level
+// instead of refining one level at a time. It has to find the same object, and
+// the point of the option is that one hop is cheaper than pyramid_levels - 1 of
+// them, so time both. The object sits at angle 0 so the +/-15 degree window
+// holds it and both modes search the same angles.
+void test_direct_refine()
+{
+    const auto model = pattern();
+    const auto placed = scene(model, 48.0, 44.0, 0.0);
+
+    shape_match_options options;
+    options.pyramid_levels = 3;
+    options.rotation_min_degrees = -15.0;
+    options.rotation_max_degrees = 15.0;
+    options.rotation_step_degrees = 1.0;
+    options.candidate_count = 64;
+
+    shape_match_options direct_options = options;
+    direct_options.direct_refine = true;
+
+    const auto ms = [](auto since) {
+        return std::chrono::duration<double, std::milli>(since).count();
+    };
+
+    double progressive_total = 0.0, direct_total = 0.0;
+    double progressive_angle = 0.0, direct_angle = 0.0;
+
+    // The first run warms the page cache and the rotation cache; time the rest.
+    for (int run = 0; run < 21; ++run)
+    {
+        shape_matcher progressive(options);
+        progressive.set_template(model);
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto r1 = progressive.match(placed);
+        const auto elapsed0 = ms(std::chrono::steady_clock::now() - t0);
+        if (run > 0) { progressive_total += elapsed0; progressive_angle = r1.angle_degrees; }
+        check_location(r1, 48.0, 44.0, 0.0);
+
+        shape_matcher direct_matcher(direct_options);
+        direct_matcher.set_template(model);
+        const auto t1 = std::chrono::steady_clock::now();
+        const auto r2 = direct_matcher.match(placed);
+        const auto elapsed1 = ms(std::chrono::steady_clock::now() - t1);
+        if (run > 0) { direct_total += elapsed1; direct_angle = r2.angle_degrees; }
+        check_location(r2, 48.0, 44.0, 0.0);
+    }
+
+    std::cout << "direct_refine off: " << (progressive_total / 20.0) << " ms (angle "
+              << progressive_angle << ")\n";
+    std::cout << "direct_refine on : " << (direct_total / 20.0) << " ms (angle "
+              << direct_angle << ")\n";
+    if (direct_total > 0.0 && direct_total < progressive_total)
+        std::cout << "direct_refine is " << (progressive_total / direct_total) << "x faster\n";
+}
+
 void test_border_object()
 {
     const auto model = pattern();
@@ -503,7 +561,9 @@ int main()
     try { test_matching(); test_result_corners(); test_rotation_corners();
           test_full_rotation_range(); test_refine_options(); test_edge_count_threshold();
           test_border_object();
-          test_validation(); }
+          test_direct_refine();
+          test_validation();
+    }
     catch (const std::exception& error)
     {
         std::cerr << error.what() << '\n';

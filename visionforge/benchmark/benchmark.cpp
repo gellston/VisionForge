@@ -92,6 +92,7 @@ int run_benchmark(int argc, char** argv)
     double rotation_max = 180.0;
     std::size_t edge_count_threshold = 0;
     std::size_t template_scale = 1;
+    bool direct_refine = false;
     if (argc >= 3)
     {
         width = static_cast<std::size_t>(std::atol(argv[1]));
@@ -115,11 +116,13 @@ int run_benchmark(int argc, char** argv)
         edge_count_threshold = static_cast<std::size_t>(std::atol(argv[10]));
     if (argc >= 12)
         template_scale = static_cast<std::size_t>(std::atol(argv[11]));
+    if (argc >= 13)
+        direct_refine = std::atol(argv[12]) != 0;
     if (width == 0 || height == 0 || runs == 0 || pyramid_levels == 0)
     {
         std::puts("usage: benchmark [width height [runs [rotation_step [pyramid_levels "
                   "[refine_radius [refine_angle_steps [rot_min [rot_max "
-                  "[edge_count_threshold]]]]]]]]]");
+                  "[edge_count_threshold [template_scale [direct_refine]]]]]]]]]]]");
         return 2;
     }
 
@@ -127,12 +130,12 @@ int run_benchmark(int argc, char** argv)
     const auto source = make_source(width, height, template_image, width / 2, height / 2);
     std::printf("source: %zu x %zu x 1 = %.2f MiB, template=%zux%zu, runs=%zu, "
                 "rot=[%.1f,%.1f] step=%.1f deg, levels=%zu, refine=+-%zupx/+-%zuang, "
-                "edge_threshold=%zu\n",
+                "edge_threshold=%zu, direct_refine=%d\n",
                 width, height, static_cast<double>(width * height) / (1024.0 * 1024.0),
                 template_image.width(), template_image.height(),
                 runs, rotation_min, rotation_max, rotation_step,
                 pyramid_levels, refine_position_radius, refine_angle_steps,
-                edge_count_threshold);
+                edge_count_threshold, direct_refine ? 1 : 0);
 
     shape_match_options options;
     options.rotation_min_degrees = rotation_min;
@@ -142,6 +145,7 @@ int run_benchmark(int argc, char** argv)
     options.refine_position_radius = refine_position_radius;
     options.refine_angle_steps = refine_angle_steps;
     options.edge_count_threshold = edge_count_threshold;
+    options.direct_refine = direct_refine;
     shape_matcher matcher(options);
 
     double set_template_total = 0.0;

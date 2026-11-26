@@ -19,8 +19,20 @@ constexpr double pi = 3.14159265358979323846;
 
 struct plane
 {
-    int width;
+    // Where this plane sits in its level's coordinates. The coarse level is
+    // the whole level (origin 0); a fine level is only pulled out of the
+    // source around the candidate boxes, so it carries its own origin and
+    // readers subtract it before indexing.
+    int x0 = 0;
+    int y0 = 0;
+    int width;       // of this crop
     int height;
+    // Full level dimensions. A crop is smaller than the level it belongs to,
+    // and readers clamp against the level's own border (gradients() never
+    // computes the outermost row or column), so the level size cannot be
+    // derived from width/height.
+    int level_width = 0;
+    int level_height = 0;
     // Pixels are 0..255, and float's 24-bit mantissa represents every integer in
     // that range exactly -- as it does the integer sums the binomial filter
     // produces -- so a single-channel pipeline is bit-identical to double while
@@ -46,6 +58,12 @@ struct region_box
 };
 struct gradient_map
 {
+    // width/height describe a crop, not necessarily the whole level: (x0, y0)
+    // is where the crop sits in level coordinates. Fine levels only ever get
+    // read inside the candidate boxes, so allocating the union of those boxes
+    // instead of the whole level turns an 83.9 MB zero-fill into a few KB.
+    int x0 = 0;
+    int y0 = 0;
     int width;
     int height;
     std::vector<gradient> pixels;
@@ -247,7 +265,10 @@ std::vector<double> make_angles(const shape_match_options& options)
     return angles;
 }
 
-plane grayscale(const image& input)
+// Shared by every entry point that reads the source. pyramid_coarse() no
+// longer goes through grayscale(), so it has to run the same check or match()
+// would accept an empty or wrong-channel image.
+void validate_source(const image& input)
 {
     const auto channels = input.channel();
     const auto max_dimension = static_cast<std::size_t>((std::numeric_limits<int>::max)() - 2);
@@ -255,8 +276,20 @@ plane grayscale(const image& input)
         || input.width() > max_dimension || input.height() > max_dimension
         || (channels != 1 && channels != 3 && channels != 4))
         throw std::invalid_argument("Expected a nonempty 1-, 3- or 4-channel image of at least 3 x 3");
+}
 
-    plane result{static_cast<int>(input.width()), static_cast<int>(input.height()), {}};
+plane grayscale(const image& input)
+{
+    validate_source(input);
+    const auto channels = input.channel();
+
+    plane result;
+    result.width = static_cast<int>(input.width());
+    result.height = static_cast<int>(input.height());
+    result.width = static_cast<int>(input.width());
+    result.height = static_cast<int>(input.height());
+    result.level_width = static_cast<int>(input.width());
+    result.level_height = static_cast<int>(input.height());
     result.pixels.resize(input.width() * input.height());
     const auto* data = input.data();
     for (std::size_t y = 0; y < input.height(); ++y)
@@ -277,7 +310,13 @@ plane downsample(const plane& input)
 {
     const int out_w = (input.width + 1) / 2;
     const int out_h = (input.height + 1) / 2;
-    plane result{out_w, out_h, {}};
+    plane result;
+    result.width = out_w;
+    result.height = out_h;
+    // The output sits at half the input's origin: output pixel j is centred on
+    // input pixel 2j, so in level coordinates the origin divides by two.
+    result.x0 = input.x0 / 2;
+    result.y0 = input.y0 / 2;
     result.pixels.resize(static_cast<std::size_t>(out_w) * out_h);
     constexpr int w[] = {1, 4, 6, 4, 1};
 
@@ -347,9 +386,226 @@ std::vector<plane> pyramid(const image& input, std::size_t levels)
     return result;
 }
 
+// Grayscale a rectangular region of the source into its own plane, carrying the
+// region's origin so readers can map level coordinates back to it. Values
+// outside the image clamp exactly as the full-level chain would, and the boxes
+// this serves sit far enough inside that the clamp never fires for a pixel that
+// is actually read.
+plane crop_grayscale(const image& input, int x0, int y0, int width, int height)
+{
+    const auto channels = input.channel();
+    plane result;
+    result.x0 = x0;
+    result.y0 = y0;
+    result.width = width;
+    result.height = height;
+    result.pixels.resize(static_cast<std::size_t>(width) * height);
+    const auto* data = input.data();
+    const int last_x = static_cast<int>(input.width()) - 1;
+    const int last_y = static_cast<int>(input.height()) - 1;
+    for (int y = 0; y < height; ++y)
+    {
+        const int source_y = std::clamp(y0 + y, 0, last_y);
+        for (int x = 0; x < width; ++x)
+        {
+            const int source_x = std::clamp(x0 + x, 0, last_x);
+            const auto index = static_cast<std::size_t>(source_y) * input.stride()
+                             + static_cast<std::size_t>(source_x) * channels;
+            const double value = channels == 1 ? data[index]
+                : (static_cast<double>(data[index]) + data[index + 1] + data[index + 2]) / 3.0;
+            result.pixels[static_cast<std::size_t>(y) * width + x] = static_cast<float>(value);
+        }
+    }
+    return result;
+}
+
+// level 1 straight from the source. The full-resolution plane is never
+// materialised: nothing reads it, because refine takes its pixels from
+// level_boxes() instead. Grayscale still happens once per source pixel, it is
+// just folded into the horizontal pass rather than written out as 20.9 MB
+// first. The filter, the clamping and the float arithmetic are the ones
+// downsample(grayscale(input)) would have used, so the result is bit-identical.
+plane downsample_from_image(const image& input)
+{
+    const auto channels = input.channel();
+    const int src_w = static_cast<int>(input.width());
+    const int src_h = static_cast<int>(input.height());
+    const int out_w = (src_w + 1) / 2;
+    const int out_h = (src_h + 1) / 2;
+    plane result;
+    result.width = out_w;
+    result.height = out_h;
+    result.pixels.resize(static_cast<std::size_t>(out_w) * out_h);
+    constexpr int w[] = {1, 4, 6, 4, 1};
+    const auto* data = input.data();
+
+    constexpr int slots = 5;
+    std::vector<float> gray(static_cast<std::size_t>(slots) * src_w);
+    std::vector<float> horizontal(static_cast<std::size_t>(slots) * out_w);
+    int gray_owner[slots];
+    int horizontal_owner[slots];
+    for (int i = 0; i < slots; ++i)
+        gray_owner[i] = horizontal_owner[i] = -1;
+
+    const auto grayscale_row = [&](int row) -> const float* {
+        const int r = std::clamp(row, 0, src_h - 1);
+        const int slot = r % slots;
+        if (gray_owner[slot] == r)
+            return gray.data() + static_cast<std::size_t>(slot) * src_w;
+        float* destination = gray.data() + static_cast<std::size_t>(slot) * src_w;
+        for (int x = 0; x < src_w; ++x)
+        {
+            const auto index = static_cast<std::size_t>(r) * input.stride()
+                             + static_cast<std::size_t>(x) * channels;
+            const double value = channels == 1 ? data[index]
+                : (static_cast<double>(data[index]) + data[index + 1] + data[index + 2]) / 3.0;
+            destination[x] = static_cast<float>(value);
+        }
+        gray_owner[slot] = r;
+        return destination;
+    };
+
+    const auto horizontal_row = [&](int row) -> const float* {
+        const int r = std::clamp(row, 0, src_h - 1);
+        const int slot = r % slots;
+        if (horizontal_owner[slot] == r)
+            return horizontal.data() + static_cast<std::size_t>(slot) * out_w;
+        const float* source = grayscale_row(r);
+        float* destination = horizontal.data() + static_cast<std::size_t>(slot) * out_w;
+        for (int x = 0; x < out_w; ++x)
+        {
+            float sum = 0.0f;
+            for (int dx = -2; dx <= 2; ++dx)
+                sum += source[std::clamp(2 * x + dx, 0, src_w - 1)] * w[dx + 2];
+            destination[x] = sum;
+        }
+        horizontal_owner[slot] = r;
+        return destination;
+    };
+
+    for (int y = 0; y < out_h; ++y)
+    {
+        const float* rows[slots];
+        for (int dy = -2; dy <= 2; ++dy)
+            rows[dy + 2] = horizontal_row(2 * y + dy);
+        for (int x = 0; x < out_w; ++x)
+        {
+            float sum = 0.0f;
+            for (int dy = -2; dy <= 2; ++dy)
+                sum += rows[dy + 2][x] * w[dy + 2];
+            result.pixels[static_cast<std::size_t>(y) * out_w + x] = sum / 256.0f;
+        }
+    }
+    return result;
+}
+
+// Only the level the full scan runs on. pyramid() still builds every level for
+// set_template(), where the template is small enough that it does not matter;
+// match() never reads the intermediate levels at full size.
+plane pyramid_coarse(const image& input, std::size_t levels)
+{
+    validate_source(input);
+    if (levels <= 1)
+        return grayscale(input);
+    plane level = downsample_from_image(input);
+    for (std::size_t i = 2; i < levels; ++i)
+        level = downsample(level);
+    return level;
+}
+
+// The pixels one refine level needs, pulled out of the source instead of
+// prebuilt. The crop is the union of the candidate boxes widened by the filter
+// radius (2^(level+1) - 2 source pixels) plus one level pixel for the Sobel
+// window -- that margin is what keeps box pixels from ever clamping at the
+// crop's own edge, so these values match what the full-level chain would have
+// produced, bit for bit.
+plane level_boxes(const image& input, int level, const std::vector<region_box>& regions)
+{
+    plane empty;
+    if (regions.empty())
+        return empty;
+
+    if (level <= 0)
+    {
+        // level 0 is the source's own scale: no resizing, just the boxes.
+        int ux0 = static_cast<int>(input.width());
+        int uy0 = static_cast<int>(input.height());
+        int ux1 = -1;
+        int uy1 = -1;
+        for (const auto& box : regions)
+        {
+            ux0 = (std::min)(ux0, box.x0 - 1);
+            uy0 = (std::min)(uy0, box.y0 - 1);
+            ux1 = (std::max)(ux1, box.x1 + 1);
+            uy1 = (std::max)(uy1, box.y1 + 1);
+        }
+        ux0 = (std::max)(ux0, 0);
+        uy0 = (std::max)(uy0, 0);
+        ux1 = (std::min)(ux1, static_cast<int>(input.width()) - 1);
+        uy1 = (std::min)(uy1, static_cast<int>(input.height()) - 1);
+        if (ux0 > ux1 || uy0 > uy1)
+            return empty;
+        plane crop = crop_grayscale(input, ux0, uy0, ux1 - ux0 + 1, uy1 - uy0 + 1);
+        crop.level_width = static_cast<int>(input.width());
+        crop.level_height = static_cast<int>(input.height());
+        return crop;
+    }
+
+    int lx0 = static_cast<int>(input.width()) << level;
+    int ly0 = static_cast<int>(input.height()) << level;
+    int lx1 = -1;
+    int ly1 = -1;
+    for (const auto& box : regions)
+    {
+        lx0 = (std::min)(lx0, box.x0);
+        ly0 = (std::min)(ly0, box.y0);
+        lx1 = (std::max)(lx1, box.x1);
+        ly1 = (std::max)(ly1, box.y1);
+    }
+    if (lx0 > lx1 || ly0 > ly1)
+        return empty;
+
+    const int scale = 1 << level;
+    const int radius = (1 << (level + 1)) - 2;
+    int sx0 = scale * (lx0 - 1) - radius;
+    int sy0 = scale * (ly0 - 1) - radius;
+    int sx1 = scale * (lx1 + 1) + radius;
+    int sy1 = scale * (ly1 + 1) + radius;
+    // Round the crop out to whole steps of the scale so the origin halves to an
+    // integer at every downsample; a fractional origin would shift the box by a
+    // pixel at each level.
+    sx0 -= sx0 % scale;
+    sy0 -= sy0 % scale;
+    sx1 += (scale - sx1 % scale) % scale;
+    sy1 += (scale - sy1 % scale) % scale;
+    sx0 = (std::max)(sx0, 0);
+    sy0 = (std::max)(sy0, 0);
+    sx1 = (std::min)(sx1, static_cast<int>(input.width()) - 1);
+    sy1 = (std::min)(sy1, static_cast<int>(input.height()) - 1);
+    if (sx0 > sx1 || sy0 > sy1 || sx0 % scale != 0 || sy0 % scale != 0)
+        return empty;
+
+    plane current = crop_grayscale(input, sx0, sy0, sx1 - sx0 + 1, sy1 - sy0 + 1);
+    for (int i = 0; i < level; ++i)
+        current = downsample(current);
+    // The level this crop belongs to, which is bigger than the crop itself.
+    int level_width = static_cast<int>(input.width());
+    int level_height = static_cast<int>(input.height());
+    for (int i = 0; i < level; ++i)
+    {
+        level_width = (level_width + 1) / 2;
+        level_height = (level_height + 1) / 2;
+    }
+    current.level_width = level_width;
+    current.level_height = level_height;
+    return current;
+}
+
 gradient_map gradients(const plane& input, double threshold)
 {
-    gradient_map result{input.width, input.height, {}, {}};
+    gradient_map result;
+    result.width = input.width;
+    result.height = input.height;
     result.pixels.resize(input.pixels.size());
     result.edge.resize(input.pixels.size());
     const double threshold_squared = threshold * threshold;
@@ -382,14 +638,48 @@ gradient_map gradients(const plane& input, double threshold)
 // nothing to leave alone. Only the pixels inside a region get a real Sobel.
 // No edge mask and no summed-area table are built: on a fine level the map is
 // dense in edges, which is exactly where those two fast paths stop paying.
+
 gradient_map lazy_gradients(const plane& input, double threshold,
                             const std::vector<region_box>& regions)
 {
     gradient_map result;
-    result.width = input.width;
-    result.height = input.height;
-    result.pixels.assign(static_cast<std::size_t>(input.width) * input.height, gradient{});
-    const double threshold_squared = threshold * threshold;
+    result.use_prefilter = false;
+    result.use_edge_mask = false;
+    if (regions.empty())
+        return result;
+
+    // The candidate boxes are all this map is ever read at, so allocate their
+    // union and remember where it sits. On a level whose candidates cluster
+    // that is a few KB instead of the 83.9 MB a full 2560x2048 gradient map
+    // would zero-fill; if the candidates are scattered the union is the whole
+    // level and this degrades to exactly the old cost, never worse.
+    // Boxes are in level coordinates, and input is only a crop of that level,
+    // so the union has to be clamped against the level -- clamping it to the
+    // crop's width instead let the fill loop write one past the union.
+    const int level_w = input.level_width > 0 ? input.level_width : input.width;
+    const int level_h = input.level_height > 0 ? input.level_height : input.height;
+    int union_x0 = level_w;
+    int union_y0 = level_h;
+    int union_x1 = -1;
+    int union_y1 = -1;
+    for (const auto& box : regions)
+    {
+        union_x0 = (std::min)(union_x0, box.x0);
+        union_y0 = (std::min)(union_y0, box.y0);
+        union_x1 = (std::max)(union_x1, box.x1);
+        union_y1 = (std::max)(union_y1, box.y1);
+    }
+    union_x0 = (std::max)(union_x0, 0);
+    union_y0 = (std::max)(union_y0, 0);
+    union_x1 = (std::min)(union_x1, level_w - 1);
+    union_y1 = (std::min)(union_y1, level_h - 1);
+    if (union_x0 > union_x1 || union_y0 > union_y1)
+        return result;
+    result.x0 = union_x0;
+    result.y0 = union_y0;
+    result.width = union_x1 - union_x0 + 1;
+    result.height = union_y1 - union_y0 + 1;
+    result.pixels.assign(static_cast<std::size_t>(result.width) * result.height, gradient{});
     const auto offset = [](int x, int y, int width) {
         return static_cast<std::size_t>(y) * static_cast<std::size_t>(width)
              + static_cast<std::size_t>(x);
@@ -402,27 +692,28 @@ gradient_map lazy_gradients(const plane& input, double threshold,
         // the end, which Debug's checked operator[] rejects with a dialog and
         // Release silently reads as garbage. Border pixels stay zero either
         // way, exactly as gradients() leaves them.
-        const int lo_x = std::max(1, box.x0);
-        const int hi_x = std::min(input.width - 2, box.x1);
-        const int lo_y = std::max(1, box.y0);
-        const int hi_y = std::min(input.height - 2, box.y1);
+        const int lo_x = (std::max)(1, box.x0);
+        const int hi_x = (std::min)(level_w - 2, box.x1);
+        const int lo_y = (std::max)(1, box.y0);
+        const int hi_y = (std::min)(level_h - 2, box.y1);
         for (int y = lo_y; y <= hi_y; ++y)
         {
             for (int x = lo_x; x <= hi_x; ++x)
             {
-                const auto value = [&](int dx, int dy) { return input.pixels[offset(x + dx, y + dy, input.width)]; };
+                const auto value = [&](int dx, int dy) {
+                    return input.pixels[offset(x + dx - input.x0, y + dy - input.y0,
+                                                input.width)];
+                };
                 const gradient g{
                     (value(1, -1) + 2.0 * value(1, 0) + value(1, 1)
                      - value(-1, -1) - 2.0 * value(-1, 0) - value(-1, 1)) / 8.0,
                     (value(-1, 1) + 2.0 * value(0, 1) + value(1, 1)
                      - value(-1, -1) - 2.0 * value(0, -1) - value(1, -1)) / 8.0};
-                result.pixels[offset(x, y, input.width)] = g;
+                result.pixels[offset(x - result.x0, y - result.y0, result.width)] = g;
             }
         }
     }
     // Dense-in-edges: both fast paths are off, so no edge mask or integral.
-    result.use_prefilter = false;
-    result.use_edge_mask = false;
     return result;
 }
 
@@ -433,7 +724,7 @@ gradient_map lazy_gradients(const plane& input, double threshold,
 // position range, the rotated feature extent, and one extra pixel.
 std::vector<region_box> visit_regions(const std::vector<candidate>& parents,
                                       const std::vector<rotated_model>& rotated,
-                                      const shape_match_options& settings)
+                                      const shape_match_options& settings, int scale)
 {
     int min_fx = std::numeric_limits<int>::max();
     int min_fy = std::numeric_limits<int>::max();
@@ -451,8 +742,8 @@ std::vector<region_box> visit_regions(const std::vector<candidate>& parents,
     regions.reserve(parents.size());
     for (const auto& parent : parents)
     {
-        const int cx = static_cast<int>(std::lround(parent.x * 2.0));
-        const int cy = static_cast<int>(std::lround(parent.y * 2.0));
+        const int cx = static_cast<int>(std::lround(parent.x * scale));
+        const int cy = static_cast<int>(std::lround(parent.y * scale));
         regions.push_back({cx - radius + min_fx - 1, cy - radius + min_fy - 1,
                            cx + radius + max_fx + 1, cy + radius + max_fy + 1});
     }
@@ -572,16 +863,23 @@ std::vector<rotated_model> rotations(const model_level& model, const std::vector
 
 bool fits(const gradient_map& map, const rotated_model& model, double x, double y)
 {
+    // "Fits" means the rotated template stays inside the region this map was
+    // built for. A dense map has x0 = y0 = 0 and this is the whole level; a
+    // cropped fine level only guarantees its own box, and coordinates arriving
+    // here are absolute, so the bounds have to start at the crop origin.
     constexpr double epsilon = 1e-9;
-    return x + model.min_x >= -epsilon && y + model.min_y >= -epsilon
-        && x + model.max_x <= map.width - 1 + epsilon
-        && y + model.max_y <= map.height - 1 + epsilon;
+    return x + model.min_x >= static_cast<double>(map.x0) - epsilon
+        && y + model.min_y >= static_cast<double>(map.y0) - epsilon
+        && x + model.max_x <= static_cast<double>(map.x0 + map.width - 1) + epsilon
+        && y + model.max_y <= static_cast<double>(map.y0 + map.height - 1) + epsilon;
 }
 
-gradient interpolate(const gradient_map& map, double x, double y)
+static gradient interpolate(const gradient_map& map, double x, double y)
 {
-    x = std::clamp(x, 0.0, static_cast<double>(map.width - 1));
-    y = std::clamp(y, 0.0, static_cast<double>(map.height - 1));
+    x = std::clamp(x, static_cast<double>(map.x0), static_cast<double>(map.x0 + map.width - 1));
+    y = std::clamp(y, static_cast<double>(map.y0), static_cast<double>(map.y0 + map.height - 1));
+    x -= map.x0;
+    y -= map.y0;
     const int x0 = static_cast<int>(x), y0 = static_cast<int>(y);
     const int x1 = (std::min)(x0 + 1, map.width - 1), y1 = (std::min)(y0 + 1, map.height - 1);
     const double fx = x - x0, fy = y - y0;
@@ -602,8 +900,8 @@ bool touches_edge(const gradient_map& map, double x, double y)
 {
     if (!map.use_edge_mask)
         return true;  // dense map: most samples touch an edge, so just interpolate
-    x = std::clamp(x, 0.0, static_cast<double>(map.width - 1));
-    y = std::clamp(y, 0.0, static_cast<double>(map.height - 1));
+    x = std::clamp(x, static_cast<double>(map.x0), static_cast<double>(map.x0 + map.width - 1)) - map.x0;
+    y = std::clamp(y, static_cast<double>(map.y0), static_cast<double>(map.y0 + map.height - 1)) - map.y0;
     const int x0 = static_cast<int>(x), y0 = static_cast<int>(y);
     const int x1 = (std::min)(x0 + 1, map.width - 1), y1 = (std::min)(y0 + 1, map.height - 1);
     const auto& edge = map.edge;
@@ -809,8 +1107,11 @@ std::vector<candidate> full_search(const gradient_map& map, const model_level& m
     return result;
 }
 
+// scale is how many finest-level pixels one coarse pixel is worth: 2 when
+// dropping a single level, 2^(level) on a direct hop to the finest level.
 std::vector<candidate> refine(const gradient_map& map, const std::vector<rotated_model>& rotated,
-                              const std::vector<candidate>& coarse, const shape_match_options& options)
+                              const std::vector<candidate>& coarse, const shape_match_options& options,
+                              int scale)
 {
     std::vector<candidate> result;
     if (coarse.empty())
@@ -827,7 +1128,7 @@ std::vector<candidate> refine(const gradient_map& map, const std::vector<rotated
                 {
                     if (profile_on())
                         ++g_prof.refine_positions;
-                    const double x = parent.x * 2.0 + dx, y = parent.y * 2.0 + dy;
+                    const double x = parent.x * scale + dx, y = parent.y * scale + dy;
                     retain(result, {x, y, angle, score(map, rotated[angle], x, y,
                         options.gradient_threshold, cutoff(result, options.candidate_count))}, options.candidate_count);
                 }
@@ -941,10 +1242,13 @@ shape_match_result shape_matcher::match(const image& source) const
     auto t_mark = prof_now();
     const auto& settings = impl_->settings;
     const auto count = settings.pyramid_levels;
-    const auto levels = pyramid(source, count);
+    // Only the level the full scan runs on gets built up front; the finer
+    // levels are pulled out of the source around the candidates by
+    // level_boxes() once those candidates exist.
+    const auto coarse = pyramid_coarse(source, count);
     const auto first = count - 1;
     if (prof) { const auto t = prof_now(); g_prof.ms_pyramid = prof_ms(t_mark, t); t_mark = t; }
-    auto map = gradients(levels[first], settings.gradient_threshold);
+    auto map = gradients(coarse, settings.gradient_threshold);
     if (prof) { const auto t = prof_now(); g_prof.ms_gradients = prof_ms(t_mark, t); t_mark = t; }
     // Decide whether the two fast paths are worth their overhead on this map,
     // then build the summed-area table only if the prefilter will actually run.
@@ -969,17 +1273,26 @@ shape_match_result shape_matcher::match(const image& source) const
     if (prof) { const auto t = prof_now(); g_prof.ms_full_search = prof_ms(t_mark, t); t_mark = t; }
     for (std::size_t level = first; level > 0 && !candidates.empty(); --level)
     {
-        rotated = &impl_->rotated_levels[level - 1];
+        // direct_refine takes the coarsest scan's candidates straight to the
+        // finest level in one hop; otherwise each pass drops exactly one level
+        // and the position error is narrowed a factor of two at a time.
+        const std::size_t target = settings.direct_refine ? std::size_t{0} : level - 1;
+        const int scale = 1 << static_cast<int>(level - target);
+        rotated = &impl_->rotated_levels[target];
         // Fine levels are only ever read at (candidate + rotated feature), so
-        // build a Sobel for exactly those boxes instead of the whole level.
-        // lazy_gradients() leaves both fast paths off for such a map.
-        map = lazy_gradients(levels[level - 1], settings.gradient_threshold,
-                             visit_regions(candidates, *rotated, settings));
+        // pull those pixels out of the source and Sobel exactly those boxes
+        // instead of building the level. lazy_gradients() leaves both fast
+        // paths off for such a map.
+        const auto regions = visit_regions(candidates, *rotated, settings, scale);
+        map = lazy_gradients(level_boxes(source, static_cast<int>(target), regions),
+                             settings.gradient_threshold, regions);
         if (prof) { const auto t = prof_now(); g_prof.ms_gradients += prof_ms(t_mark, t); t_mark = t; }
         g_prof.in_refine = true;
-        candidates = refine(map, *rotated, candidates, settings);
+        candidates = refine(map, *rotated, candidates, settings, scale);
         g_prof.in_refine = false;
         if (prof) { const auto t = prof_now(); g_prof.ms_refine += prof_ms(t_mark, t); t_mark = t; }
+        if (settings.direct_refine)
+            break;  // the hop went to the finest level, there is nothing left
     }
     if (prof)
     {
